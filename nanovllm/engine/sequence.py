@@ -71,6 +71,16 @@ class Sequence:
         self.last_token = token_id
         self.num_tokens += 1
 
+    def pop_token(self):
+        token_id = self.token_ids.pop()
+        self.num_tokens -= 1
+        self.last_token = self.token_ids[-1] if self.token_ids else None
+        return token_id
+    
+    def truncate(self, rollback_num_tokens: int):
+        for _ in range(rollback_num_tokens):
+            self.pop_token()
+
     def __getstate__(self):
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
                 self.token_ids if self.num_completion_tokens == 0 else self.last_token)

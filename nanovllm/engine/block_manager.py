@@ -110,3 +110,15 @@ class BlockManager:
             self.hash_to_block_id[h] = last_block.block_id
         else:
             assert last_block.hash == -1
+
+    def truncate(self, seq: Sequence, rollback_num_tokens: int):
+        last_block_num_tokens = seq.last_block_num_tokens
+        if rollback_num_tokens < last_block_num_tokens:
+            return
+        num_blocks_to_free = (rollback_num_tokens - last_block_num_tokens) // self.block_size + 1
+        for _ in range(num_blocks_to_free):
+            block_id = seq.block_table.pop()
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
