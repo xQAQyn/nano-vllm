@@ -1,7 +1,7 @@
 import os
 from huggingface_hub import snapshot_download
 
-size = "1.7"
+size = "0.6"
 
 def download_model():
     # ---------------- 配置区域 ----------------
