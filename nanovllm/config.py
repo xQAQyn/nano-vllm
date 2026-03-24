@@ -16,6 +16,10 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    # EAGLE speculative decoding options
+    eagle_draft_model: str | None = None
+    speculation_depth: int = 4
+    eagle_enabled: bool = False
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -24,3 +28,11 @@ class Config:
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         assert self.max_num_batched_tokens >= self.max_model_len
+        if self.eagle_enabled:
+            assert self.eagle_draft_model is not None, "eagle_draft_model must be specified when eagle_enabled=True"
+            # Allow draft model path to be a directory (for loading) or None (for creating new)
+            if self.eagle_draft_model is not None and not os.path.isdir(self.eagle_draft_model):
+                # Check if it's a special value like "new" for creating a new draft model
+                if self.eagle_draft_model != "new":
+                    raise AssertionError(f"Draft model path does not exist: {self.eagle_draft_model}")
+            assert self.speculation_depth >= 1, "speculation_depth must be at least 1"
