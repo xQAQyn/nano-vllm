@@ -31,6 +31,10 @@ class BlockManager:
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
+        
+        # EAGLE speculative decoding extensions (Stage 3)
+        # Track draft blocks separately for speculative tokens
+        self.draft_block_ids: dict[int, list[int]] = {}  # seq_id -> list of draft block ids
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -122,3 +126,64 @@ class BlockManager:
             block.ref_count -= 1
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
+
+    # EAGLE speculative decoding methods (Stage 3)
+    
+    def can_allocate_draft(self, seq: Sequence, draft_num_tokens: int) -> bool:
+        """Check if we can allocate blocks for draft tokens."""
+        draft_num_blocks = (draft_num_tokens + self.block_size - 1) // self.block_size
+        return len(self.free_block_ids) >= draft_num_blocks
+
+    def allocate_draft(self, seq: Sequence, draft_num_tokens: int):
+        """Allocate blocks for draft tokens (speculative blocks)."""
+        assert seq.seq_id not in self.draft_block_ids or len(self.draft_block_ids[seq.seq_id]) == 0
+        draft_num_blocks = (draft_num_tokens + self.block_size - 1) // self.block_size
+        draft_blocks = []
+        
+        for _ in range(draft_num_blocks):
+            block_id = self.free_block_ids[0]
+            block = self._allocate_block(block_id)
+            draft_blocks.append(block_id)
+        
+        self.draft_block_ids[seq.seq_id] = draft_blocks
+        return draft_blocks
+
+    def deallocate_draft(self, seq: Sequence):
+        """Deallocate draft blocks on rejection or after acceptance."""
+        if seq.seq_id not in self.draft_block_ids:
+            return
+        
+        for block_id in self.draft_block_ids[seq.seq_id]:
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+        
+        del self.draft_block_ids[seq.seq_id]
+
+    def commit_draft(self, seq: Sequence):
+        """Commit draft blocks to the sequence's main block table."""
+        if seq.seq_id not in self.draft_block_ids:
+            return
+        
+        draft_blocks = self.draft_block_ids.pop(seq.seq_id)
+        seq.block_table.extend(draft_blocks)
+
+    def rollback_draft_blocks(self, seq: Sequence, num_rejected_tokens: int):
+        """Rollback draft blocks when tokens are rejected."""
+        if seq.seq_id not in self.draft_block_ids:
+            return
+        
+        draft_blocks = self.draft_block_ids[seq.seq_id]
+        num_blocks_to_free = (num_rejected_tokens + self.block_size - 1) // self.block_size
+        
+        # Free blocks from the end
+        for _ in range(min(num_blocks_to_free, len(draft_blocks))):
+            block_id = draft_blocks.pop()
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+        
+        if not draft_blocks:
+            del self.draft_block_ids[seq.seq_id]

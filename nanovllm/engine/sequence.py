@@ -2,6 +2,8 @@ from copy import copy
 from enum import Enum, auto
 from itertools import count
 
+import torch
+
 from nanovllm.sampling_params import SamplingParams
 
 
@@ -27,6 +29,12 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        
+        # EAGLE speculative decoding extensions (Stage 3)
+        self.draft_token_ids: list[int] = []
+        self.draft_features: torch.Tensor | None = None
+        self.accepted_mask: list[bool] = []
+        self.speculation_depth: int = 0
 
     def __len__(self):
         return self.num_tokens
@@ -80,6 +88,47 @@ class Sequence:
     def truncate(self, rollback_num_tokens: int):
         for _ in range(rollback_num_tokens):
             self.pop_token()
+
+    # EAGLE speculative decoding methods (Stage 3)
+    
+    def append_draft_token(self, token_id: int, feature: torch.Tensor | None = None):
+        """Append a draft token predicted by the draft model."""
+        self.draft_token_ids.append(token_id)
+        self.speculation_depth = len(self.draft_token_ids)
+        if feature is not None:
+            if self.draft_features is None:
+                self.draft_features = []
+            self.draft_features.append(feature)
+
+    def set_draft_tokens(self, token_ids: list[int], features: torch.Tensor | None = None):
+        """Set multiple draft tokens at once."""
+        self.draft_token_ids = token_ids.copy()
+        self.draft_features = features
+        self.speculation_depth = len(token_ids)
+        self.accepted_mask = []
+
+    def clear_draft(self):
+        """Clear all draft token state."""
+        self.draft_token_ids.clear()
+        self.draft_features = None
+        self.accepted_mask.clear()
+        self.speculation_depth = 0
+
+    def rollback_draft(self, num_rejected: int):
+        """Rollback rejected draft tokens from the end."""
+        if num_rejected > 0:
+            self.draft_token_ids = self.draft_token_ids[:-num_rejected] if num_rejected < len(self.draft_token_ids) else []
+            if self.draft_features is not None and isinstance(self.draft_features, list):
+                self.draft_features = self.draft_features[:-num_rejected] if num_rejected < len(self.draft_features) else []
+            self.accepted_mask = self.accepted_mask[:-num_rejected] if num_rejected < len(self.accepted_mask) else []
+            self.speculation_depth = len(self.draft_token_ids)
+
+    def apply_accepted_tokens(self):
+        """Apply accepted draft tokens to the main token sequence."""
+        for i, token_id in enumerate(self.draft_token_ids):
+            if i < len(self.accepted_mask) and self.accepted_mask[i]:
+                self.append_token(token_id)
+        self.clear_draft()
 
     def __getstate__(self):
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
