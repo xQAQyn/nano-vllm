@@ -173,12 +173,38 @@ class Qwen3Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
+        return_hidden_states: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass through the model.
+
+        Args:
+            input_ids: Input token IDs, shape [batch_size, seq_len]
+            positions: Position IDs, shape [batch_size, seq_len]
+            return_hidden_states: If True, return second-to-last layer hidden states
+                                 for EAGLE draft model. Default: False.
+
+        Returns:
+            If return_hidden_states is False:
+                Normalized hidden states, shape [batch_size, seq_len, hidden_size]
+            If return_hidden_states is True:
+                Tuple of (normalized_hidden_states, second_to_last_hidden_states)
+        """
         hidden_states = self.embed_tokens(input_ids)
         residual = None
-        for layer in self.layers:
+
+        # Track second-to-last layer hidden states if needed
+        second_to_last_hidden = None
+
+        for i, layer in enumerate(self.layers):
             hidden_states, residual = layer(positions, hidden_states, residual)
+            # Store hidden states from second-to-last layer
+            if return_hidden_states and i == len(self.layers) - 2:
+                second_to_last_hidden = hidden_states.clone()
+
         hidden_states, _ = self.norm(hidden_states, residual)
+
+        if return_hidden_states and second_to_last_hidden is not None:
+            return hidden_states, second_to_last_hidden
         return hidden_states
 
 
@@ -196,6 +222,7 @@ class Qwen3ForCausalLM(nn.Module):
         config: Qwen3Config
     ) -> None:
         super().__init__()
+        self.config = config
         self.model = Qwen3Model(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
@@ -205,8 +232,23 @@ class Qwen3ForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.model(input_ids, positions)
+        return_hidden_states: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass through the causal LM.
+
+        Args:
+            input_ids: Input token IDs, shape [batch_size, seq_len]
+            positions: Position IDs, shape [batch_size, seq_len]
+            return_hidden_states: If True, return second-to-last layer hidden states
+                                 for EAGLE draft model. Default: False.
+
+        Returns:
+            If return_hidden_states is False:
+                Final hidden states, shape [batch_size, seq_len, hidden_size]
+            If return_hidden_states is True:
+                Tuple of (final_hidden_states, second_to_last_hidden_states)
+        """
+        return self.model(input_ids, positions, return_hidden_states=return_hidden_states)
 
     def compute_logits(
         self,
