@@ -198,3 +198,5 @@ models/
 data/
 drafts/
 eagle_cache/
+analysis_output/
+benchmark_results/

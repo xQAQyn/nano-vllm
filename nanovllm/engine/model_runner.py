@@ -8,6 +8,7 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
+from nanovllm.layers.speculative_sampler import SpeculativeSampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
@@ -31,6 +32,25 @@ class ModelRunner:
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
+        
+        # EAGLE speculative decoding support
+        self.eagle_enabled = config.eagle_enabled
+        self.speculation_depth = config.speculation_depth
+        self.draft_model = None
+        self.speculative_sampler = None
+        if self.eagle_enabled:
+            from nanovllm.models.eagle import load_draft_model
+            from nanovllm.engine.eagle_runner import EagleDraftRunner
+            self.draft_model = load_draft_model(
+                hf_config, self.model, draft_model_path=config.eagle_draft_model
+            )
+            self.draft_model.eval()
+            self.draft_runner = EagleDraftRunner(
+                draft_model=self.draft_model,
+                max_speculation_depth=self.speculation_depth,
+            )
+            self.speculative_sampler = SpeculativeSampler()
+        
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
@@ -53,10 +73,15 @@ class ModelRunner:
             dist.barrier()
             if self.rank == 0:
                 self.shm.unlink()
-        if not self.enforce_eager:
+        if not self.enforce_eager and hasattr(self, 'graphs'):
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
-        dist.destroy_process_group()
+        # Only destroy process group if it was initialized
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        except Exception:
+            pass
 
     def loop(self):
         while True:
@@ -206,12 +231,217 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        # Use EAGLE speculative decoding if enabled and not in prefill phase
+        if self.eagle_enabled and not is_prefill and len(seqs) == 1:
+            return self.run_eagle(seqs)
+        else:
+            input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+            temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+            logits = self.run_model(input_ids, positions, is_prefill)
+            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+            reset_context()
+            return token_ids
+
+    def run_eagle(self, seqs: list[Sequence]) -> list[int]:
+        """Run EAGLE speculative decoding for a single sequence.
+
+        Steps:
+        1. Run target model to get hidden states from second-to-last layer
+        2. Use draft model to generate K draft tokens autoregressively
+        3. Run target model once with all draft tokens to get verification logits
+        4. Use speculative sampling to accept/reject draft tokens
+        5. Return accepted tokens (or resampled token on rejection)
+        """
+        assert len(seqs) == 1, "EAGLE currently supports single sequence only"
+        seq = seqs[0]
+
+        # Prepare decode input
+        input_ids, positions = self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
-        reset_context()
-        return token_ids
+        temperature = temperatures[0].item() if temperatures is not None else 1.0
+
+        # Run target model to get hidden states and logits for current position
+        # We need hidden states from second-to-last layer for draft model
+        with torch.inference_mode():
+            # Get logits for current token (to compute draft acceptance later)
+            current_logits = self.run_model(input_ids, positions, is_prefill=False)
+
+            # Get hidden states from target model for draft generation
+            # Run model with return_hidden_states=True
+            hidden_states, second_to_last_hidden = self.model(
+                input_ids, positions, return_hidden_states=True
+            )
+            reset_context()
+
+        # Generate draft tokens using draft model
+        # Use the second-to-last hidden states as input to draft model
+        with torch.inference_mode():
+            draft_token_ids, draft_features = self.draft_runner.generate_draft_tokens(
+                hidden_states=second_to_last_hidden,
+                token_ids=input_ids,
+                positions=positions,
+                num_draft_tokens=self.speculation_depth,
+            )
+
+        # Now run target model with draft tokens to get verification logits
+        # Append draft tokens to input for verification
+        draft_input_ids = torch.cat([
+            input_ids,
+            torch.tensor(draft_token_ids, dtype=input_ids.dtype, device=input_ids.device)
+        ])
+        draft_positions = torch.arange(
+            positions[0].item(),
+            positions[0].item() + len(draft_input_ids),
+            dtype=positions.dtype,
+            device=positions.device,
+        )
+
+        # Prepare context for extended sequence (verification phase)
+        # This is a prefill operation - we need to compute KV for all tokens
+        seq_len = len(draft_input_ids)
+        cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device=input_ids.device)
+        
+        # Compute slot_mapping for the extended sequence
+        # For verification, we need to store KV cache for all positions
+        # The sequence already has context_len tokens, and we're adding draft tokens
+        # We need to store KV at the correct positions in the cache
+        slot_mapping = []
+        context_len = len(seq)  # Current sequence length before adding draft tokens
+        for i in range(seq_len):
+            # Position in the full sequence
+            pos = context_len - 1 + i  # Start from last position
+            # Compute block index and offset within block
+            block_idx = pos // self.block_size
+            offset_in_block = pos % self.block_size
+            # Get the physical block ID from block table
+            if block_idx < len(seq.block_table):
+                physical_block = seq.block_table[block_idx]
+                slot = physical_block * self.block_size + offset_in_block
+            else:
+                # Fallback: use last block (should not happen in normal operation)
+                slot = seq.block_table[-1] * self.block_size + offset_in_block
+            slot_mapping.append(slot)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, device=input_ids.device)
+        
+        set_context(
+            is_prefill=True,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=seq_len,
+            max_seqlen_k=seq_len,
+            slot_mapping=slot_mapping,
+        )
+
+        with torch.inference_mode():
+            # Run target model on full sequence including draft tokens
+            full_hidden = self.model(draft_input_ids, draft_positions)
+            full_logits = self.model.compute_logits(full_hidden)
+            reset_context()
+
+        # Extract logits for draft token positions (positions after current)
+        # draft_logits_start is the position where draft tokens begin
+        draft_logits_start = len(input_ids)
+        
+        # Safety check: ensure we have enough logits
+        if full_logits.shape[0] <= draft_logits_start:
+            # Fallback: no draft logits available, sample from current position
+            result_tokens = self.sampler(
+                current_logits, temperatures
+            ).tolist() if self.rank == 0 else []
+            return result_tokens
+        
+        target_logits_for_draft = full_logits[draft_logits_start:]  # [K, vocab_size]
+        
+        # Safety check: ensure target_logits_for_draft has the right shape
+        if target_logits_for_draft.shape[0] != len(draft_token_ids):
+            # Mismatch - use what we have or fallback
+            if target_logits_for_draft.shape[0] == 0:
+                result_tokens = self.sampler(
+                    current_logits, temperatures
+                ).tolist() if self.rank == 0 else []
+                return result_tokens
+            # Truncate draft tokens to match available logits
+            draft_token_ids = draft_token_ids[:target_logits_for_draft.shape[0]]
+
+        # Get draft model logits for the same positions
+        # We need to run draft model again to get logits for all draft positions
+        with torch.inference_mode():
+            # Prepare draft inputs for all positions
+            if len(draft_token_ids) > 1:
+                draft_token_ids_tensor = torch.tensor(
+                    draft_token_ids[:-1], dtype=input_ids.dtype, device=input_ids.device
+                )  # All but last draft token
+                draft_hidden_input = second_to_last_hidden[-1:].expand(len(draft_token_ids) - 1, -1)
+                draft_pos_input = torch.arange(
+                    draft_logits_start,
+                    draft_logits_start + len(draft_token_ids) - 1,
+                    dtype=positions.dtype,
+                    device=positions.device,
+                )
+
+                cu_seqlens_draft = torch.tensor(
+                    [0, len(draft_token_ids) - 1], dtype=torch.int32, device=input_ids.device
+                )
+                set_context(
+                    is_prefill=True,
+                    cu_seqlens_q=cu_seqlens_draft,
+                    cu_seqlens_k=cu_seqlens_draft,
+                    max_seqlen_q=len(draft_token_ids) - 1,
+                    max_seqlen_k=len(draft_token_ids) - 1,
+                )
+                _, draft_logits = self.draft_model(
+                    token_ids=draft_token_ids_tensor,
+                    hidden_states=draft_hidden_input,
+                    positions=draft_pos_input,
+                )
+                reset_context()
+            else:
+                draft_logits = target_logits_for_draft[:1]  # Fallback for single draft token
+
+        # Perform speculative sampling to verify draft tokens
+        # Use non-compiled version to avoid torch.compile issues
+        with torch.inference_mode():
+            accepted_tokens, accepted_mask, resampled_token = self.speculative_sampler.verify_tokens(
+                target_logits=target_logits_for_draft,
+                draft_logits=draft_logits,
+                draft_token_ids=draft_token_ids,
+                temperature=temperature,
+            )
+        
+        # Update sequence state with accepted tokens
+        for i, (token_id, accepted) in enumerate(zip(draft_token_ids, accepted_mask)):
+            if accepted:
+                seq.append_token(token_id)
+                seq.accepted_mask.append(True)
+            else:
+                seq.accepted_mask.append(False)
+                # Add resampled token on rejection
+                if resampled_token is not None:
+                    seq.append_token(resampled_token)
+                break
+        
+        # Clear draft state
+        seq.clear_draft()
+        
+        # Return the last generated token(s)
+        # For compatibility with scheduler, return the last token
+        result_tokens = []
+        if accepted_mask and any(accepted_mask):
+            # Return all accepted tokens
+            result_tokens = accepted_tokens
+            if resampled_token is not None and not all(accepted_mask):
+                result_tokens.append(resampled_token)
+        else:
+            # All rejected, use resampled token
+            if resampled_token is not None:
+                result_tokens = [resampled_token]
+            else:
+                # Fallback: sample from current logits
+                result_tokens = self.sampler(
+                    current_logits, temperatures
+                ).tolist() if self.rank == 0 else []
+        
+        return result_tokens
 
     @torch.inference_mode()
     def capture_cudagraph(self):

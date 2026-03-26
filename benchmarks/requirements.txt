@@ -1,0 +1,9 @@
+# EAGLE Benchmark Dependencies
+# Install with: pip install -r benchmarks/requirements.txt
+
+# Required for GPU metrics
+pynvml>=11.0.0
+
+# Optional: For visualization and analysis
+matplotlib>=3.7.0
+numpy>=1.24.0

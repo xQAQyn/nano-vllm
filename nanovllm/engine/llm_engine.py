@@ -38,6 +38,11 @@ class LLMEngine:
         del self.model_runner
         for p in self.ps:
             p.join()
+        # Clean up atexit handler
+        try:
+            atexit.unregister(self.exit)
+        except Exception:
+            pass
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
@@ -46,10 +51,47 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self):
+        """Execute a single step of the generation loop.
+
+        For standard decoding:
+        1. Schedule sequences (prefill or decode)
+        2. Run model forward pass
+        3. Postprocess results
+
+        For EAGLE speculative decoding:
+        1. Schedule sequences
+        2. Run draft model to generate K draft tokens
+        3. Run target model verification
+        4. Postprocess with acceptance/rejection
+
+        Returns:
+            tuple:
+                - outputs: List of (seq_id, token_ids) for finished sequences
+                - num_tokens: Number of tokens processed (positive for prefill, negative for decode)
+        """
         seqs, is_prefill = self.scheduler.schedule()
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+
+        # For EAGLE, pass speculation info to model runner
+        if self.scheduler.eagle_enabled and not is_prefill:
+            # EAGLE mode: model runner handles draft + verify internally
+            token_ids = self.model_runner.call("run", seqs, is_prefill)
+            # For EAGLE, token_ids may be a list of lists (multiple tokens per seq)
+            # Normalize to list[int] format for scheduler
+            if token_ids and isinstance(token_ids[0], list):
+                # Multiple tokens per sequence - take last token for compatibility
+                last_tokens = [tokens[-1] if tokens else 0 for tokens in token_ids]
+                self.scheduler.postprocess(seqs, last_tokens)
+                # Collect all accepted tokens for output
+                outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+            else:
+                self.scheduler.postprocess(seqs, token_ids)
+                outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        else:
+            # Standard mode
+            token_ids = self.model_runner.call("run", seqs, is_prefill)
+            self.scheduler.postprocess(seqs, token_ids)
+            outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
         return outputs, num_tokens
 

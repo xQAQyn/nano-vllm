@@ -30,9 +30,11 @@ class Config:
         assert self.max_num_batched_tokens >= self.max_model_len
         if self.eagle_enabled:
             assert self.eagle_draft_model is not None, "eagle_draft_model must be specified when eagle_enabled=True"
-            # Allow draft model path to be a directory (for loading) or None (for creating new)
-            if self.eagle_draft_model is not None and not os.path.isdir(self.eagle_draft_model):
-                # Check if it's a special value like "new" for creating a new draft model
-                if self.eagle_draft_model != "new":
+            # Allow draft model path to be a directory, a file (for loading weights), or "new" (for creating new)
+            if self.eagle_draft_model is not None:
+                is_dir = os.path.isdir(self.eagle_draft_model)
+                is_file = os.path.isfile(self.eagle_draft_model)
+                is_special = self.eagle_draft_model == "new"
+                if not (is_dir or is_file or is_special):
                     raise AssertionError(f"Draft model path does not exist: {self.eagle_draft_model}")
             assert self.speculation_depth >= 1, "speculation_depth must be at least 1"
